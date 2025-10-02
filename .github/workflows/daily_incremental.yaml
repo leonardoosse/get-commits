@@ -2,7 +2,7 @@ name: daily_commits
 
 on:
   schedule:
-    - cron: "15 03 * * *"  # 03:15 UTC (~00:15 BRT) ajuste como quiser
+    - cron: "15 03 * * *"  # 03:15 UTC (~00:15 BRT)
   workflow_dispatch:
 
 permissions:
@@ -27,6 +27,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install boto3 requests
+
       - name: Compute window (ontem → hoje em UTC)
         id: win
         run: |
@@ -48,10 +53,7 @@ jobs:
           GH_ORG: ${{ env.GH_ORG }}
           SINCE: ${{ steps.win.outputs.since }}
           UNTIL: ${{ steps.win.outputs.until }}
-          OUTDIR: out
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          S3_PREFIX: ${{ env.S3_PREFIX }}
         run: |
           python scripts/collect_commits.py
-
-      - name: Upload to S3
-        run: |
-          aws s3 cp out "s3://${S3_BUCKET}/${S3_PREFIX}/" --recursive --only-show-errors

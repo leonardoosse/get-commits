@@ -1,21 +1,50 @@
 #!/usr/bin/env python3
-import os, sys, json, time, hashlib
-from datetime import datetime, timezone
-from urllib.parse import urlencode
+# -*- coding: utf-8 -*-
+
+"""
+Coletor de commits por usuário (autor) agregados por dia (UTC),
+gravando 1 arquivo canônico por dia/usuário em S3:
+  s3://<bucket>/<prefix>/<user_key>/dt=YYYY-MM-DD/commits-<org>-<YYYY-MM-DD>.jsonl.gz
+
+- Dedup na origem por SHA (dentro do run) e ao mesclar com o arquivo existente.
+- Sem concorrência: sobrescreve o arquivo diário apenas quando houver novidades.
+"""
+
+import os
+import sys
+import json
+import time
+import io
+import gzip
+import shutil
 import requests
+from datetime import datetime, timezone
 from collections import defaultdict
+from urllib.parse import urlencode
 
-GITHUB_API = os.getenv("GITHUB_API", "https://api.github.com")
+import boto3
+from botocore.exceptions import ClientError
+
+# -------- Config via ENV --------
+GITHUB_API   = os.getenv("GITHUB_API", "https://api.github.com")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GH_ORG = os.getenv("GH_ORG")  # org
-SINCE = os.getenv("SINCE")  # ISO 8601
-UNTIL = os.getenv("UNTIL")  # ISO 8601
-REPO_FILTER = os.getenv("REPO_FILTER", "")  # opcional: regex simples (contém)
-OUTDIR = os.getenv("OUTDIR", "out")  # pasta local temporária antes de subir ao S3
-MAX_REPOS = int(os.getenv("MAX_REPOS", "0"))  # 0 = sem limite (útil p/ testes)
+GH_ORG        = os.getenv("GH_ORG")             # org
+SINCE        = os.getenv("SINCE")             # ISO 8601 (ex: 2025-02-01T00:00:00Z)
+UNTIL        = os.getenv("UNTIL")             # ISO 8601 (ex: 2025-02-15T00:00:00Z)
+REPO_FILTER  = os.getenv("REPO_FILTER", "")   # substring opcional para filtrar repos
+MAX_REPOS = int(os.getenv("MAX_REPOS", "0"))  # 0 = sem limite (útil p/ teste)
 
-if not GITHUB_TOKEN or not GH_ORG or not SINCE or not UNTIL:
-    print("Missing env: GITHUB_TOKEN, GH_ORG, SINCE, UNTIL", file=sys.stderr)
+# S3 (modo arquivo único por dia)
+S3_BUCKET    = os.getenv("S3_BUCKET")         # ex: my-bucket
+S3_PREFIX    = os.getenv("S3_PREFIX", "github/commits")  # ex: github/commits
+
+# -------- Validações básicas --------
+missing = []
+for var in ("GITHUB_TOKEN", "GH_ORG", "SINCE", "UNTIL", "S3_BUCKET", "S3_PREFIX"):
+    if not globals().get(var):
+        missing.append(var)
+if missing:
+    print(f"[ERRO] Missing env: {', '.join(missing)}", file=sys.stderr)
     sys.exit(2)
 
 session = requests.Session()
@@ -33,8 +62,8 @@ def gh_paged(url, params=None):
         qp = params.copy()
         qp.update({"per_page": per_page, "page": page})
         r = session.get(url, params=qp, timeout=60)
+        # backoff simples para secondary rate limit
         if r.status_code == 403 and "secondary rate limit" in r.text.lower():
-            # backoff básico
             time.sleep(15)
             continue
         r.raise_for_status()
@@ -61,15 +90,14 @@ def list_branches(owner, repo):
 
 def list_commits(owner, repo, sha, since, until):
     url = f"{GITHUB_API}/repos/{owner}/{repo}/commits"
-    # Importante: buscar por branch (sha) e janela de tempo
     for c in gh_paged(url, {"sha": sha, "since": since, "until": until}):
         yield c
 
 def normalize_user_key(commit):
     """
-    Retorna uma chave de usuário para agregação:
-    - Preferimos author.login quando disponível (commit feito por conta GitHub)
-    - Se não houver, usamos o e-mail do autor (podendo ser 'user@users.noreply.github.com')
+    Chave de usuário para agregação:
+    - Preferimos author.login; fallback para e-mail do author do commit.
+    - Se nada existir, gera um marcador 'unknown:<hash curto>'.
     """
     author = commit.get("author")  # user object (pode ser None)
     commit_author = commit.get("commit", {}).get("author", {})  # metadados do commit
@@ -80,8 +108,9 @@ def normalize_user_key(commit):
         return f"github:{login}"
     if email:
         return f"email:{email}"
-    # fallback extremo: hash do nome+msg
+    # fallback
     raw = json.dumps(commit.get("commit", {}), sort_keys=True)
+    import hashlib
     return "unknown:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 def commit_utc_date(commit):
@@ -94,13 +123,69 @@ def commit_utc_date(commit):
     except Exception:
         return "unknown-date"
 
+# -------- S3 helpers (arquivo único por dia) --------
+s3 = boto3.client("s3")
+
+def s3_key_daily(user_key, day_str):
+    # arquivo canônico comprimido
+    return f"{S3_PREFIX}/{user_key}/dt={day_str}/commits-{GH_ORG}-{day_str}.jsonl.gz"
+
+def load_daily_records(user_key, day_str):
+    """
+    Lê o arquivo diário do S3 (se existir) e retorna dict[sha] = record.
+    """
+    key = s3_key_daily(user_key, day_str)
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        data = gzip.decompress(obj["Body"].read()).decode("utf-8")
+        d = {}
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            try:
+                doc = json.loads(line)
+                sha = doc.get("sha")
+                if sha:
+                    d[sha] = doc
+            except Exception:
+                continue
+        return d
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("NoSuchKey", "404"):
+            return {}
+        raise
+
+def save_daily_records(user_key, day_str, recs_by_sha):
+    """
+    Sobrescreve o arquivo diário em S3 com os registros (JSONL gzip).
+    """
+    key = s3_key_daily(user_key, day_str)
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="w") as gz:
+        # opcional: ordenar para estabilidade (por repo+sha)
+        for sha, r in sorted(recs_by_sha.items(), key=lambda kv: (kv[1].get("repo",""), kv[0])):
+            gz.write((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8"))
+    buf.seek(0)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=buf.getvalue(),
+        ContentType="application/gzip",
+        ContentEncoding="gzip"
+    )
+
+# -------- Exec principal --------
 def main():
-    os.makedirs(OUTDIR, exist_ok=True)
     repos = list(list_repos(GH_ORG))
     if MAX_REPOS > 0:
         repos = repos[:MAX_REPOS]
 
     total_seen = 0
+
+    # bucket[user_key][day] = [records...]
+    bucket = defaultdict(lambda: defaultdict(list))
+
     for repo in repos:
         print(f"[INFO] Repo: {repo}", file=sys.stderr)
         seen_shas = set()
@@ -110,9 +195,6 @@ def main():
         except requests.HTTPError as e:
             print(f"[WARN] branches fail {repo}: {e}", file=sys.stderr)
             continue
-
-        # agregador: user_key -> date (YYYY-MM-DD) -> [records]
-        bucket = defaultdict(lambda: defaultdict(list))
 
         for br in branches:
             try:
@@ -136,8 +218,6 @@ def main():
                         "committer_email": (c.get("commit", {}).get("committer", {}) or {}).get("email"),
                         "committer_name": (c.get("commit", {}).get("committer", {}) or {}).get("name"),
                         "message": (c.get("commit") or {}).get("message"),
-                        "added": c.get("stats", {}).get("additions"),  # geralmente ausente aqui
-                        "removed": c.get("stats", {}).get("deletions"),
                         "timestamp": (c.get("commit", {}).get("author", {}) or {}).get("date"),
                         "url": c.get("html_url"),
                         "is_merge": True if (c.get("parents") and len(c["parents"]) > 1) else False,
@@ -145,24 +225,30 @@ def main():
                     }
                     bucket[user_key][day].append(record)
                     total_seen += 1
-
             except requests.HTTPError as e:
                 print(f"[WARN] commits fail {repo}@{br}: {e}", file=sys.stderr)
                 continue
 
-        # escreve arquivos por user_key/day
-        part = int(time.time())
-        for user_key, days in bucket.items():
-            safe_user = user_key.replace("/", "_")
-            for day, recs in days.items():
-                subdir = os.path.join(OUTDIR, safe_user, f"dt={day}")
-                os.makedirs(subdir, exist_ok=True)
-                outpath = os.path.join(subdir, f"commits-{day}-part-{part}.jsonl")
-                with open(outpath, "w", encoding="utf-8") as f:
-                    for r in recs:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # Merge por user_key/dia com arquivo diário no S3
+    touched = 0
+    for user_key, days in bucket.items():
+        for day, recs in days.items():  # day = 'YYYY-MM-DD'
+            existing = load_daily_records(user_key, day)
+            before = len(existing)
 
-    print(f"[DONE] Commits únicos coletados: {total_seen}", file=sys.stderr)
+            # mescla: mantém primeiro o que existe, depois adiciona novos shas
+            merged = dict(existing)
+            for r in recs:
+                sha = r.get("sha")
+                if sha and sha not in merged:
+                    merged[sha] = r
+
+            if len(merged) != before:
+                save_daily_records(user_key, day, merged)
+                touched += 1
+
+    print(f"[DONE] Commits únicos vistos nesta coleta: {total_seen}", file=sys.stderr)
+    print(f"[DONE] Arquivos diários atualizados em S3: {touched}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

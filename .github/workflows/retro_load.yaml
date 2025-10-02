@@ -30,7 +30,7 @@ env:
   GH_ORG: my-org
   AWS_REGION: us-east-1
   S3_BUCKET: your-bucket-name
-  S3_PREFIX: github/commits  # prefixo base
+  S3_PREFIX: github/commits
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -45,8 +45,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps (none needed)
-        run: python -V
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install boto3 requests
 
       - name: Configure AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -57,14 +59,12 @@ jobs:
       - name: Run collector
         uses: actions/setup-python@v5
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_READ_ORG }}  # classic fine-grained ou PAT com repo/org:read
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_READ_ORG }}
           OWNER: ${{ env.GH_ORG }}
           SINCE: ${{ inputs.since }}
           UNTIL: ${{ inputs.until }}
           REPO_FILTER: ${{ inputs.repo_filter }}
           MAX_REPOS: ${{ inputs.max_repos }}
-          OUTDIR: out
+          S3_BUCKET: ${{ env.S3_BUCKET }}
+          S3_PREFIX: ${{ env.S3_PREFIX }}
 
-      - name: Upload to S3 (preserva árvore user/dt)
-        run: |
-          aws s3 cp out "s3://${S3_BUCKET}/${S3_PREFIX}/" --recursive --only-show-errors
