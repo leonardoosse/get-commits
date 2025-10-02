@@ -1,0 +1,57 @@
+name: daily_commits
+
+on:
+  schedule:
+    - cron: "15 03 * * *"  # 03:15 UTC (~00:15 BRT) ajuste como quiser
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+
+env:
+  GH_ORG: my-org
+  AWS_REGION: us-east-1
+  S3_BUCKET: your-bucket-name
+  S3_PREFIX: github/commits
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compute window (ontem → hoje em UTC)
+        id: win
+        run: |
+          since=$(date -u -d 'yesterday 00:00' +'%Y-%m-%dT%H:%M:%SZ')
+          until=$(date -u -d 'today 00:00' +'%Y-%m-%dT%H:%M:%SZ')
+          echo "since=$since" >> $GITHUB_OUTPUT
+          echo "until=$until" >> $GITHUB_OUTPUT
+          echo "Window: $since .. $until"
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::11111111:role/github-oidc-uploader
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Run collector
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_READ_ORG }}
+          GH_ORG: ${{ env.GH_ORG }}
+          SINCE: ${{ steps.win.outputs.since }}
+          UNTIL: ${{ steps.win.outputs.until }}
+          OUTDIR: out
+        run: |
+          python scripts/collect_commits.py
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp out "s3://${S3_BUCKET}/${S3_PREFIX}/" --recursive --only-show-errors

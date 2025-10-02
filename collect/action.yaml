@@ -1,0 +1,14 @@
+      - name: Run collector
+        uses: actions/setup-python@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN_READ_ORG }}  # classic fine-grained ou PAT com repo/org:read
+          OWNER: ${{ env.GH_ORG }}
+          SINCE: ${{ inputs.since }}
+          UNTIL: ${{ inputs.until }}
+          REPO_FILTER: ${{ inputs.repo_filter }}
+          MAX_REPOS: ${{ inputs.max_repos }}
+          OUTDIR: out
+        run: |
+          python $GITHUB_ACTION_PATH/collect_commits.py
+          echo "Local out tree:"
+          find out -type f | head -n 50
