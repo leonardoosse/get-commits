@@ -1,100 +1,61 @@
-name: report_on_demand
+name: Generate Commit Report
 
 on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: 'Data inicial (YYYY-MM-DD)'
+        description: 'Start date (YYYY-MM-DD)'
         required: true
         type: string
       end_date:
-        description: 'Data final (YYYY-MM-DD)'
+        description: 'End date (YYYY-MM-DD)'
         required: true
         type: string
-      user_key:
-        description: 'Usuário (opcional): ex. github:joao ou email:foo@bar.com'
+      username:
+        description: 'Specific user (optional)'
         required: false
         type: string
-
-permissions:
-  contents: read
-  id-token: write   # OIDC para AWS
-
-env:
-  AWS_REGION: us-east-1
-  S3_BUCKET: your-bucket-name
-  S3_PREFIX: github/commits
-  OUT_CSV: report.csv
-  PYTHONUNBUFFERED: "1"
+      format:
+        description: 'Report format'
+        required: true
+        type: choice
+        options:
+          - excel
+          - csv
+        default: excel
 
 jobs:
-  build_report:
+  generate-report:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Validate inputs (<= 31 dias e mesmo mês/ano)
-        id: validate
-        shell: bash
-        run: |
-          start="${{ inputs.start_date }}"
-          end="${{ inputs.end_date }}"
-          # formato
-          date -d "$start" >/dev/null 2>&1 || { echo "Data inicial inválida"; exit 1; }
-          date -d "$end"   >/dev/null 2>&1 || { echo "Data final inválida"; exit 1; }
-
-          # normalizar para YYYY-MM-DD
-          s=$(date -u -d "$start" +%Y-%m-%d)
-          e=$(date -u -d "$end" +%Y-%m-%d)
-
-          # end >= start
-          if [[ "$(date -u -d "$e" +%s)" -lt "$(date -u -d "$s" +%s)" ]]; then
-            echo "end_date deve ser >= start_date"; exit 1
-          fi
-
-          # mesmo mês e ano
-          sm=$(date -u -d "$s" +%Y-%m)
-          em=$(date -u -d "$e" +%Y-%m)
-          if [[ "$sm" != "$em" ]]; then
-            echo "O período deve estar dentro do mesmo mês/ano."; exit 1
-          fi
-
-          # limite 31 dias (incluindo as pontas)
-          days=$(( ( $(date -u -d "$e" +%s) - $(date -u -d "$s" +%s) ) / 86400 + 1 ))
-          if (( days > 31 )); then
-            echo "Janela máxima é de 31 dias."; exit 1
-          fi
-
-          echo "start_norm=$s" >> $GITHUB_OUTPUT
-          echo "end_norm=$e" >> $GITHUB_OUTPUT
+      - name: Checkout
+        uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: Configure AWS (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::123456789012:role/github-oidc-uploader
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Generate CSV
-        env:
-          S3_BUCKET: ${{ env.S3_BUCKET }}
-          S3_PREFIX: ${{ env.S3_PREFIX }}
-          START_DATE: ${{ steps.validate.outputs.start_norm }}
-          END_DATE:   ${{ steps.validate.outputs.end_norm }}
-          USER_KEY:   ${{ inputs.user_key }}
-          OUT_CSV:    ${{ env.OUT_CSV }}
+      - name: Install dependencies
         run: |
-          python scripts/report_commits_csv.py
-          ls -lh "${OUT_CSV}"
+          pip install boto3 pandas openpyxl python-dateutil
 
-      - name: Upload CSV artifact
-        uses: actions/upload-artifact@v4
+      - name: Generate Report
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+        run: |
+          python generate_report.py \
+            --start-date "${{ inputs.start_date }}" \
+            --end-date "${{ inputs.end_date }}" \
+            --username "${{ inputs.username }}" \
+            --format "${{ inputs.format }}"
+
+      - name: Upload Report as Artifact
+        uses: actions/upload-artifact@v3
         with:
-          name: commits-report_${{ inputs.user_key && inputs.user_key || 'all' }}_${{ steps.validate.outputs.start_norm }}_to_${{ steps.validate.outputs.end_norm }}
-          path: ${{ env.OUT_CSV }}
-          if-no-files-found: error
+          name: commit-report-${{ inputs.start_date }}-to-${{ inputs.end_date }}
+          path: report.*
+          retention-days: 30

@@ -1,254 +1,355 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Coletor de commits por usuário (autor) agregados por dia (UTC),
-gravando 1 arquivo canônico por dia/usuário em S3:
-  s3://<bucket>/<prefix>/<user_key>/dt=YYYY-MM-DD/commits-<org>-<YYYY-MM-DD>.jsonl.gz
-
-- Dedup na origem por SHA (dentro do run) e ao mesclar com o arquivo existente.
-- Sem concorrência: sobrescreve o arquivo diário apenas quando houver novidades.
-"""
-
 import os
-import sys
 import json
+import argparse
 import time
-import io
-import gzip
-import shutil
-import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from collections import defaultdict
-from urllib.parse import urlencode
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
-from botocore.exceptions import ClientError
+from github import Github, GithubException, RateLimitExceededException
+from dateutil import parser as date_parser
 
-# -------- Config via ENV --------
-GITHUB_API   = os.getenv("GITHUB_API", "https://api.github.com")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GH_ORG        = os.getenv("GH_ORG")             # org
-SINCE        = os.getenv("SINCE")             # ISO 8601 (ex: 2025-02-01T00:00:00Z)
-UNTIL        = os.getenv("UNTIL")             # ISO 8601 (ex: 2025-02-15T00:00:00Z)
-REPO_FILTER  = os.getenv("REPO_FILTER", "")   # substring opcional para filtrar repos
-MAX_REPOS = int(os.getenv("MAX_REPOS", "0"))  # 0 = sem limite (útil p/ teste)
+# Common bot usernames to exclude
+BOT_USERNAMES = {
+    'dependabot[bot]',
+    'dependabot-preview[bot]',
+    'renovate[bot]',
+    'renovatebot',
+    'greenkeeper[bot]',
+    'snyk-bot',
+    'github-actions[bot]',
+    'codecov[bot]',
+    'sonarcloud[bot]',
+    'mergify[bot]',
+    'allcontributors[bot]',
+    'imgbot[bot]',
+    'dependabot',
+    'renovate',
+}
 
-# S3 (modo arquivo único por dia)
-S3_BUCKET    = os.getenv("S3_BUCKET")         # ex: my-bucket
-S3_PREFIX    = os.getenv("S3_PREFIX", "github/commits")  # ex: github/commits
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start-date', required=True)
+    parser.add_argument('--end-date', required=True)
+    parser.add_argument('--repo-filter', default='')
+    parser.add_argument('--max-workers', type=int, default=5, 
+                        help='Number of parallel workers (default: 5)')
+    return parser.parse_args()
 
-# -------- Validações básicas --------
-missing = []
-for var in ("GITHUB_TOKEN", "GH_ORG", "SINCE", "UNTIL", "S3_BUCKET", "S3_PREFIX"):
-    if not globals().get(var):
-        missing.append(var)
-if missing:
-    print(f"[ERRO] Missing env: {', '.join(missing)}", file=sys.stderr)
-    sys.exit(2)
+def validate_date_range(start_date, end_date):
+    start = datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+    
+    if (end - start).days > 30:
+        raise ValueError("Maximum range of 30 days allowed")
+    
+    return start, end
 
-session = requests.Session()
-session.headers.update({
-    "Authorization": f"Bearer {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28"
-})
+def is_bot_user(username, author_name='', author_email=''):
+    """Check if user is a bot based on username, name or email"""
+    if not username:
+        return True
+    
+    # Check username
+    username_lower = username.lower()
+    if username_lower in BOT_USERNAMES or '[bot]' in username_lower:
+        return True
+    
+    # Check author name
+    if author_name:
+        name_lower = author_name.lower()
+        if 'bot' in name_lower or '[bot]' in name_lower:
+            return True
+    
+    # Check email
+    if author_email:
+        email_lower = author_email.lower()
+        if 'noreply' in email_lower or 'bot' in email_lower:
+            return True
+    
+    return False
 
-def gh_paged(url, params=None):
-    params = params or {}
-    per_page = 100
-    page = 1
-    while True:
-        qp = params.copy()
-        qp.update({"per_page": per_page, "page": page})
-        r = session.get(url, params=qp, timeout=60)
-        # backoff simples para secondary rate limit
-        if r.status_code == 403 and "secondary rate limit" in r.text.lower():
-            time.sleep(15)
-            continue
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            break
-        yield from data
-        if len(data) < per_page:
-            break
-        page += 1
+def check_rate_limit(github_client, min_remaining=100):
+    """Checks and waits if necessary when rate limit is low"""
+    rate_limit = github_client.get_rate_limit()
+    remaining = rate_limit.core.remaining
+    reset_time = rate_limit.core.reset
+    
+    print(f"Rate Limit: {remaining}/{rate_limit.core.limit} requests remaining")
+    
+    # If less than min_remaining requests remain, wait for reset
+    if remaining < min_remaining:
+        wait_time = (reset_time - datetime.utcnow()).total_seconds() + 10
+        if wait_time > 0:
+            print(f"⚠️  Low rate limit! Waiting {int(wait_time/60)} minutes...")
+            time.sleep(wait_time)
+            print("✅ Rate limit reset. Continuing...")
+            # Verify reset
+            rate_limit = github_client.get_rate_limit()
+            print(f"Rate Limit after reset: {rate_limit.core.remaining}/{rate_limit.core.limit}")
 
-def list_repos(owner):
-    url = f"{GITHUB_API}/orgs/{owner}/repos"
-    for repo in gh_paged(url, {"type": "all", "sort": "full_name"}):
-        name = repo["name"]
-        if REPO_FILTER and REPO_FILTER not in name:
-            continue
-        yield name
+def get_repositories(github_client, repo_filter):
+    """Gets list of repositories from the organization (excludes archived)"""
+    org_name = os.getenv('GITHUB_ORG', 'your-org')
+    org = github_client.get_organization(org_name)
+    
+    if repo_filter:
+        repo_names = [r.strip() for r in repo_filter.split(',')]
+        repos = [org.get_repo(name) for name in repo_names]
+    else:
+        repos = list(org.get_repos())
+    
+    # Filter out archived repositories
+    active_repos = [repo for repo in repos if not repo.archived]
+    archived_count = len(repos) - len(active_repos)
+    
+    if archived_count > 0:
+        print(f"ℹ️  Excluded {archived_count} archived repositories")
+    
+    return active_repos
 
-def list_branches(owner, repo):
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/branches"
-    for br in gh_paged(url):
-        yield br["name"]
-
-def list_commits(owner, repo, sha, since, until):
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/commits"
-    for c in gh_paged(url, {"sha": sha, "since": since, "until": until}):
-        yield c
-
-def normalize_user_key(commit):
-    """
-    Chave de usuário para agregação:
-    - Preferimos author.login; fallback para e-mail do author do commit.
-    - Se nada existir, gera um marcador 'unknown:<hash curto>'.
-    """
-    author = commit.get("author")  # user object (pode ser None)
-    commit_author = commit.get("commit", {}).get("author", {})  # metadados do commit
-    login = author["login"] if author and author.get("login") else None
-    email = (commit_author.get("email") or "").lower()
-
-    if login:
-        return f"github:{login}"
-    if email:
-        return f"email:{email}"
-    # fallback
-    raw = json.dumps(commit.get("commit", {}), sort_keys=True)
-    import hashlib
-    return "unknown:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-
-def commit_utc_date(commit):
-    dt = commit.get("commit", {}).get("author", {}).get("date")
-    if not dt:
-        return "unknown-date"
+def process_single_repo(repo, start_date, end_date, github_client):
+    """Process a single repository and return commits"""
+    repo_commits = defaultdict(dict)
+    repo_name = repo.name
+    
     try:
-        d = datetime.fromisoformat(dt.replace("Z","+00:00")).astimezone(timezone.utc)
-        return d.strftime("%Y-%m-%d")
-    except Exception:
-        return "unknown-date"
-
-# -------- S3 helpers (arquivo único por dia) --------
-s3 = boto3.client("s3")
-
-def s3_key_daily(user_key, day_str):
-    # arquivo canônico comprimido
-    return f"{S3_PREFIX}/{user_key}/dt={day_str}/commits-{GH_ORG}-{day_str}.jsonl.gz"
-
-def load_daily_records(user_key, day_str):
-    """
-    Lê o arquivo diário do S3 (se existir) e retorna dict[sha] = record.
-    """
-    key = s3_key_daily(user_key, day_str)
-    try:
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-        data = gzip.decompress(obj["Body"].read()).decode("utf-8")
-        d = {}
-        for line in data.splitlines():
-            if not line.strip():
+        # Check rate limit before processing
+        check_rate_limit(github_client, min_remaining=50)
+        
+        # Fetch commits in the period from ALL branches
+        # GitHub API returns commits from all branches by default
+        commits = repo.get_commits(since=start_date, until=end_date)
+        
+        commit_count = 0
+        bot_count = 0
+        
+        for commit in commits:
+            # Skip commits without author
+            if not commit.author:
                 continue
-            try:
-                doc = json.loads(line)
-                sha = doc.get("sha")
-                if sha:
-                    d[sha] = doc
-            except Exception:
+            
+            username = commit.author.login
+            sha = commit.sha
+            
+            # Get author info
+            author_name = commit.commit.author.name if commit.commit.author else ''
+            author_email = commit.commit.author.email if commit.commit.author else ''
+            
+            # Skip bots
+            if is_bot_user(username, author_name, author_email):
+                bot_count += 1
                 continue
-        return d
-    except ClientError as e:
-        code = e.response.get("Error", {}).get("Code", "")
-        if code in ("NoSuchKey", "404"):
-            return {}
-        raise
-
-def save_daily_records(user_key, day_str, recs_by_sha):
-    """
-    Sobrescreve o arquivo diário em S3 com os registros (JSONL gzip).
-    """
-    key = s3_key_daily(user_key, day_str)
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode="w") as gz:
-        # opcional: ordenar para estabilidade (por repo+sha)
-        for sha, r in sorted(recs_by_sha.items(), key=lambda kv: (kv[1].get("repo",""), kv[0])):
-            gz.write((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8"))
-    buf.seek(0)
-    s3.put_object(
-        Bucket=S3_BUCKET,
-        Key=key,
-        Body=buf.getvalue(),
-        ContentType="application/gzip",
-        ContentEncoding="gzip"
-    )
-
-# -------- Exec principal --------
-def main():
-    repos = list(list_repos(GH_ORG))
-    if MAX_REPOS > 0:
-        repos = repos[:MAX_REPOS]
-
-    total_seen = 0
-
-    # bucket[user_key][day] = [records...]
-    bucket = defaultdict(lambda: defaultdict(list))
-
-    for repo in repos:
-        print(f"[INFO] Repo: {repo}", file=sys.stderr)
-        seen_shas = set()
-        # listar branches
-        try:
-            branches = list(list_branches(GH_ORG, repo))
-        except requests.HTTPError as e:
-            print(f"[WARN] branches fail {repo}: {e}", file=sys.stderr)
-            continue
-
-        for br in branches:
-            try:
-                for c in list_commits(GH_ORG, repo, br, SINCE, UNTIL):
-                    sha = c.get("sha")
-                    if not sha or sha in seen_shas:
-                        continue
-                    seen_shas.add(sha)
-
-                    user_key = normalize_user_key(c)
-                    day = commit_utc_date(c)
-
-                    record = {
-                        "sha": sha,
-                        "repo": f"{GH_ORG}/{repo}",
-                        "branch": br,
-                        "author_login": (c.get("author") or {}).get("login"),
-                        "author_email": (c.get("commit", {}).get("author", {}) or {}).get("email"),
-                        "author_name": (c.get("commit", {}).get("author", {}) or {}).get("name"),
-                        "committer_login": (c.get("committer") or {}).get("login"),
-                        "committer_email": (c.get("commit", {}).get("committer", {}) or {}).get("email"),
-                        "committer_name": (c.get("commit", {}).get("committer", {}) or {}).get("name"),
-                        "message": (c.get("commit") or {}).get("message"),
-                        "timestamp": (c.get("commit", {}).get("author", {}) or {}).get("date"),
-                        "url": c.get("html_url"),
-                        "is_merge": True if (c.get("parents") and len(c["parents"]) > 1) else False,
-                        "verified": (c.get("commit", {}).get("verification", {}) or {}).get("verified", False),
+            
+            # Avoid duplicates (same commit in multiple branches)
+            if sha not in repo_commits[username]:
+                commit_data = {
+                    'sha': sha,
+                    'message': commit.commit.message,
+                    'date': commit.commit.author.date.isoformat(),
+                    'repository': repo_name,
+                    'author_name': author_name,
+                    'author_email': author_email,
+                    'url': commit.html_url,
+                    'stats': {
+                        'additions': commit.stats.additions if commit.stats else 0,
+                        'deletions': commit.stats.deletions if commit.stats else 0,
+                        'total': commit.stats.total if commit.stats else 0
                     }
-                    bucket[user_key][day].append(record)
-                    total_seen += 1
-            except requests.HTTPError as e:
-                print(f"[WARN] commits fail {repo}@{br}: {e}", file=sys.stderr)
-                continue
+                }
+                
+                repo_commits[username][sha] = commit_data
+                commit_count += 1
+        
+        status = f"✓ Found {commit_count} unique commits"
+        if bot_count > 0:
+            status += f" (excluded {bot_count} bot commits)"
+        
+        return {
+            'success': True,
+            'repo': repo_name,
+            'commits': repo_commits,
+            'status': status
+        }
+                
+    except RateLimitExceededException:
+        return {
+            'success': False,
+            'repo': repo_name,
+            'error': 'rate_limit',
+            'status': '⚠️  Rate limit exceeded'
+        }
+        
+    except GithubException as e:
+        return {
+            'success': False,
+            'repo': repo_name,
+            'error': 'github_api',
+            'status': f'✗ GitHub API error: {str(e)}'
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'repo': repo_name,
+            'error': 'unexpected',
+            'status': f'✗ Unexpected error: {str(e)}'
+        }
 
-    # Merge por user_key/dia com arquivo diário no S3
-    touched = 0
-    for user_key, days in bucket.items():
-        for day, recs in days.items():  # day = 'YYYY-MM-DD'
-            existing = load_daily_records(user_key, day)
-            before = len(existing)
+def collect_commits(github_client, start_date, end_date, repo_filter, max_workers=5):
+    """Collects commits from all repositories in parallel"""
+    repos = get_repositories(github_client, repo_filter)
+    
+    # Structure: {username: {commit_sha: commit_data}}
+    user_commits = defaultdict(dict)
+    
+    total_repos = len(repos)
+    print(f"\nTotal repositories to process: {total_repos}")
+    print(f"Using {max_workers} parallel workers\n")
+    
+    processed = 0
+    failed_repos = []
+    
+    # Process repos in parallel
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_repo = {
+            executor.submit(process_single_repo, repo, start_date, end_date, github_client): repo
+            for repo in repos
+        }
+        
+        # Process completed tasks
+        for future in as_completed(future_to_repo):
+            processed += 1
+            result = future.result()
+            
+            print(f"[{processed}/{total_repos}] {result['repo']}: {result['status']}")
+            
+            if result['success']:
+                # Merge commits into main structure
+                for username, commits in result['commits'].items():
+                    for sha, commit_data in commits.items():
+                        if sha not in user_commits[username]:
+                            user_commits[username][sha] = commit_data
+            else:
+                failed_repos.append(result)
+                
+                # If rate limit error, wait and retry
+                if result.get('error') == 'rate_limit':
+                    print(f"  Retrying {result['repo']} after rate limit reset...")
+                    check_rate_limit(github_client, min_remaining=100)
+                    
+                    # Retry this repo
+                    retry_result = process_single_repo(
+                        future_to_repo[future], 
+                        start_date, 
+                        end_date, 
+                        github_client
+                    )
+                    
+                    if retry_result['success']:
+                        print(f"  ✓ Retry successful for {result['repo']}")
+                        for username, commits in retry_result['commits'].items():
+                            for sha, commit_data in commits.items():
+                                if sha not in user_commits[username]:
+                                    user_commits[username][sha] = commit_data
+                        failed_repos.remove(result)
+    
+    # Report failed repos
+    if failed_repos:
+        print(f"\n⚠️  Failed to process {len(failed_repos)} repositories:")
+        for failed in failed_repos:
+            print(f"  - {failed['repo']}: {failed['status']}")
+    
+    return user_commits
 
-            # mescla: mantém primeiro o que existe, depois adiciona novos shas
-            merged = dict(existing)
-            for r in recs:
-                sha = r.get("sha")
-                if sha and sha not in merged:
-                    merged[sha] = r
+def upload_to_s3(user_commits, start_date, end_date):
+    """Uploads data to S3 organized by user and date"""
+    s3_client = boto3.client('s3')
+    bucket = os.getenv('S3_BUCKET')
+    
+    for username, commits in user_commits.items():
+        # Group commits by date
+        commits_by_date = defaultdict(list)
+        
+        for commit_data in commits.values():
+            commit_date = date_parser.parse(commit_data['date']).date()
+            commits_by_date[commit_date].append(commit_data)
+        
+        # Upload one file per date
+        for date, day_commits in commits_by_date.items():
+            date_str = date.strftime('%Y-%m-%d')
+            s3_key = f"github/commits/{username}/{date_str}/commits.json"
+            
+            # Check if file already exists for this date
+            existing_commits = {}
+            try:
+                response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+                existing_commits = {
+                    c['sha']: c for c in json.loads(response['Body'].read())
+                }
+            except s3_client.exceptions.NoSuchKey:
+                pass
+            
+            # Merge with existing commits (avoid duplicates)
+            for commit in day_commits:
+                existing_commits[commit['sha']] = commit
+            
+            # Upload updated file
+            commits_list = list(existing_commits.values())
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=s3_key,
+                Body=json.dumps(commits_list, indent=2),
+                ContentType='application/json'
+            )
+            
+            print(f"Uploaded {len(commits_list)} commits for {username} on {date_str}")
 
-            if len(merged) != before:
-                save_daily_records(user_key, day, merged)
-                touched += 1
+def main():
+    args = parse_args()
+    
+    # Validation
+    start_date, end_date = validate_date_range(args.start_date, args.end_date)
+    
+    # GitHub client
+    github_token = os.getenv('GITHUB_TOKEN')
+    g = Github(github_token, per_page=100)  # Optimize pagination
+    
+    # Check initial rate limit
+    print("="*60)
+    check_rate_limit(g, min_remaining=100)
+    print("="*60)
+    
+    # Collect commits
+    print(f"\nCollecting commits from {args.start_date} to {args.end_date}")
+    print(f"Excluding bot commits: {len(BOT_USERNAMES)} known bots")
+    
+    user_commits = collect_commits(
+        g, 
+        start_date, 
+        end_date, 
+        args.repo_filter,
+        max_workers=args.max_workers
+    )
+    
+    print("\n" + "="*60)
+    print(f"Total developers: {len(user_commits)}")
+    for user, commits in sorted(user_commits.items(), key=lambda x: len(x[1]), reverse=True):
+        print(f"  {user}: {len(commits)} commits")
+    print("="*60)
+    
+    # Upload to S3
+    print("\nUploading to S3...")
+    upload_to_s3(user_commits, start_date, end_date)
+    
+    # Final rate limit
+    print("\n" + "="*60)
+    check_rate_limit(g)
+    print("="*60)
+    
+    print("\n✅ Collection completed successfully!")
 
-    print(f"[DONE] Commits únicos vistos nesta coleta: {total_seen}", file=sys.stderr)
-    print(f"[DONE] Arquivos diários atualizados em S3: {touched}", file=sys.stderr)
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

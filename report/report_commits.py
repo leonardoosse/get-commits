@@ -1,149 +1,208 @@
-#!/usr/bin/env python3
-import os, sys, csv, json, subprocess, tempfile, shutil
+import os
+import json
+import argparse
 from datetime import datetime, timedelta
-import gzip
+import boto3
+import pandas as pd
+from dateutil import parser as date_parser
 
-BUCKET = os.getenv("S3_BUCKET")
-PREFIX = os.getenv("S3_PREFIX", "github/commits")
-START = os.getenv("START_DATE")   # YYYY-MM-DD
-END = os.getenv("END_DATE")       # YYYY-MM-DD (vamos incluir o dia)
-USER_KEY = os.getenv("USER_KEY", "").strip()  # ex: github:joao ou email:foo@bar
-OUT_CSV = os.getenv("OUT_CSV", "report.csv")
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--start-date', required=True)
+    parser.add_argument('--end-date', required=True)
+    parser.add_argument('--username', default='')
+    parser.add_argument('--format', choices=['excel', 'csv'], default='excel')
+    return parser.parse_args()
 
-if not BUCKET or not START or not END:
-    print("Missing env: S3_BUCKET, START_DATE, END_DATE", file=sys.stderr)
-    sys.exit(2)
+def validate_date_range(start_date, end_date):
+    start = datetime.strptime(start_date, '%Y-%m-%d')
+    end = datetime.strptime(end_date, '%Y-%m-%d')
+    
+    if (end - start).days > 30:
+        raise ValueError("Maximum range of 30 days allowed")
+    
+    return start, end
 
-def daterange(start_date, end_date_inclusive):
-    cur = start_date
-    while cur <= end_date_inclusive:
-        yield cur
-        cur += timedelta(days=1)
+def get_date_range(start_date, end_date):
+    """Generates list of dates between start and end"""
+    dates = []
+    current = start_date
+    while current <= end_date:
+        dates.append(current)
+        current += timedelta(days=1)
+    return dates
 
-def run(cmd):
-    res = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    # aws s3 cp/ls em caminho inexistente retorna !=0; seguimos sem abortar
-    return res
+def list_s3_users(s3_client, bucket):
+    """Lists all available users in S3"""
+    prefix = "github/commits/"
+    paginator = s3_client.get_paginator('list_objects_v2')
+    
+    users = set()
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter='/'):
+        for prefix_obj in page.get('CommonPrefixes', []):
+            user = prefix_obj['Prefix'].replace(prefix, '').rstrip('/')
+            users.add(user)
+    
+    return list(users)
 
-def list_users():
-    # Lista "diretórios" de usuários: s3://bucket/prefix/<user>/
-    # Saída do aws s3 ls: linhas com "                           PRE github:joao/"
-    cmd = f'aws s3 ls "s3://{BUCKET}/{PREFIX}/"'
-    res = run(cmd)
-    users = []
-    for line in res.stdout.splitlines():
-        line = line.strip()
-        if line.endswith("/") and "PRE " in line:
-            u = line.split("PRE ", 1)[1].rstrip("/")
-            users.append(u)
-    return users
+def fetch_commits_from_s3(s3_client, bucket, username, start_date, end_date):
+    """Fetches commits from S3 for a user in the period"""
+    all_commits = []
+    dates = get_date_range(start_date, end_date)
+    
+    for date in dates:
+        date_str = date.strftime('%Y-%m-%d')
+        s3_key = f"github/commits/{username}/{date_str}/commits.json"
+        
+        try:
+            response = s3_client.get_object(Bucket=bucket, Key=s3_key)
+            commits = json.loads(response['Body'].read())
+            all_commits.extend(commits)
+        except s3_client.exceptions.NoSuchKey:
+            # No commits on this day
+            continue
+        except Exception as e:
+            print(f"Error reading {s3_key}: {str(e)}")
+            continue
+    
+    return all_commits
 
-def download_day_for_user(tmpdir, user_key, day):
-    s3path = f"s3://{BUCKET}/{PREFIX}/{user_key}/dt={day.strftime('%Y-%m-%d')}/"
-    locdir = os.path.join(tmpdir, user_key.replace("/", "_"), f"dt={day.strftime('%Y-%m-%d')}")
-    os.makedirs(locdir, exist_ok=True)
-    cmd = f'aws s3 cp "{s3path}" "{locdir}/" --recursive --only-show-errors'
-    run(cmd)
-    return locdir
+def collect_all_commits(start_date, end_date, username_filter=None):
+    """Collects all commits from S3"""
+    s3_client = boto3.client('s3')
+    bucket = os.getenv('S3_BUCKET')
+    
+    # Define user list
+    if username_filter:
+        usernames = [username_filter]
+    else:
+        usernames = list_s3_users(s3_client, bucket)
+    
+    print(f"Processing {len(usernames)} user(s)...")
+    
+    all_data = []
+    for username in usernames:
+        print(f"  Fetching commits from {username}...")
+        commits = fetch_commits_from_s3(s3_client, bucket, username, start_date, end_date)
+        
+        for commit in commits:
+            all_data.append({
+                'username': username,
+                'author_name': commit.get('author_name', ''),
+                'author_email': commit.get('author_email', ''),
+                'commit_sha': commit['sha'],
+                'commit_date': commit['date'],
+                'repository': commit['repository'],
+                'message': commit['message'],
+                'additions': commit['stats']['additions'],
+                'deletions': commit['stats']['deletions'],
+                'total_changes': commit['stats']['total'],
+                'url': commit['url']
+            })
+    
+    return all_data
+
+def generate_summary_stats(df):
+    """Generates summary statistics by user"""
+    summary = df.groupby('username').agg({
+        'commit_sha': 'count',
+        'additions': 'sum',
+        'deletions': 'sum',
+        'total_changes': 'sum',
+        'repository': lambda x: len(x.unique())
+    }).rename(columns={
+        'commit_sha': 'total_commits',
+        'repository': 'repositories_count'
+    })
+    
+    summary = summary.reset_index()
+    summary = summary.sort_values('total_commits', ascending=False)
+    
+    return summary
+
+def save_report(data, summary, start_date, end_date, format_type):
+    """Saves the report in the specified format"""
+    # Convert to DataFrame
+    df = pd.DataFrame(data)
+    
+    # Sort by date and user
+    if not df.empty:
+        df['commit_date'] = pd.to_datetime(df['commit_date'])
+        df = df.sort_values(['username', 'commit_date'], ascending=[True, False])
+    
+    # File name
+    date_range = f"{start_date.strftime('%Y%m%d')}-{end_date.strftime('%Y%m%d')}"
+    
+    if format_type == 'excel':
+        filename = f"report.{date_range}.xlsx"
+        
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            # Summary sheet
+            summary.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # All commits sheet
+            df.to_excel(writer, sheet_name='Commits', index=False)
+            
+            # Adjust column widths
+            for sheet_name in writer.sheets:
+                worksheet = writer.sheets[sheet_name]
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+        
+        print(f"\nExcel report generated: {filename}")
+        
+    else:  # CSV
+        filename_summary = f"report.{date_range}.summary.csv"
+        filename_details = f"report.{date_range}.details.csv"
+        
+        summary.to_csv(filename_summary, index=False)
+        df.to_csv(filename_details, index=False)
+        
+        print(f"\nCSV reports generated:")
+        print(f"  - {filename_summary}")
+        print(f"  - {filename_details}")
 
 def main():
-    start_date = datetime.strptime(START, "%Y-%m-%d").date()
-    end_date = datetime.strptime(END, "%Y-%m-%d").date()
+    args = parse_args()
+    
+    # Validation
+    start_date, end_date = validate_date_range(args.start_date, args.end_date)
+    
+    # Collect data
+    print(f"Generating report from {args.start_date} to {args.end_date}")
+    if args.username:
+        print(f"Filtering by user: {args.username}")
+    
+    data = collect_all_commits(start_date, end_date, args.username)
+    
+    if not data:
+        print("\nNo commits found in the specified period.")
+        return
+    
+    # Generate summary
+    df = pd.DataFrame(data)
+    summary = generate_summary_stats(df)
+    
+    # Display statistics
+    print(f"\n{'='*60}")
+    print(f"Total commits: {len(data)}")
+    print(f"Total developers: {len(summary)}")
+    print(f"\nTop 5 developers by commits:")
+    print(summary.head().to_string(index=False))
+    print(f"{'='*60}\n")
+    
+    # Save report
+    save_report(data, summary, start_date, end_date, args.format)
+    print("\n✅ Report generated successfully!")
 
-    tmpdir = tempfile.mkdtemp(prefix="commits_dl_")
-    rows = []
-
-    # chaves de dedup
-    seen = set()
-    dedup_all_users = (USER_KEY == "")
-
-    try:
-        users = [USER_KEY] if USER_KEY else list_users()
-
-        for u in users:
-            for day in daterange(start_date, end_date):
-                locdir = download_day_for_user(tmpdir, u, day)
-
-                # ler todos os arquivos jsonl/jsonl.gz do diretório
-                for root, _, files in os.walk(locdir):
-                    for fn in files:
-                        fp = os.path.join(root, fn)
-                        # suporte a .jsonl e .jsonl.gz
-                        if fn.endswith(".jsonl"):
-                            opener = lambda p: open(p, "r", encoding="utf-8")
-                        elif fn.endswith(".jsonl.gz"):
-                            opener = lambda p: gzip.open(p, "rt", encoding="utf-8")
-                        else:
-                            continue
-
-                        try:
-                            with opener(fp) as f:
-                                for line in f:
-                                    line = line.strip()
-                                    if not line:
-                                        continue
-                                    try:
-                                        doc = json.loads(line)
-                                    except Exception:
-                                        continue
-
-                                    # montar linha do CSV
-                                    timestamp = (doc.get("timestamp") or "")
-                                    date_utc = ""
-                                    if timestamp:
-                                        try:
-                                            dt = datetime.fromisoformat(timestamp.replace("Z","+00:00"))
-                                            date_utc = dt.strftime("%Y-%m-%d")
-                                        except Exception:
-                                            pass
-
-                                    user_login = doc.get("author_login") or ""
-                                    user_email = (doc.get("author_email") or "").lower()
-                                    user_key_from_record = (
-                                        f"github:{user_login}" if user_login
-                                        else (f"email:{user_email}" if user_email else "")
-                                    )
-
-                                    repo = doc.get("repo") or ""
-                                    sha  = doc.get("sha") or ""
-
-                                    # dedup seguro
-                                    if USER_KEY:
-                                        dedup_key = (repo, sha)
-                                    else:
-                                        dedup_key = (repo, sha, user_key_from_record)
-
-                                    if not sha or dedup_key in seen:
-                                        continue
-                                    seen.add(dedup_key)
-
-                                    rows.append({
-                                        "date": date_utc,
-                                        "user_key": user_key_from_record,
-                                        "repo": repo,
-                                        "branch": doc.get("branch") or "",
-                                        "sha": sha,
-                                        "message": (doc.get("message") or "").replace("\n", " ").strip(),
-                                        "is_merge": "true" if doc.get("is_merge") else "false",
-                                        "verified": "true" if (doc.get("verified") is True) else "false",
-                                        "url": doc.get("url") or "",
-                                    })
-                        except Exception:
-                            # continua mesmo se um arquivo específico tiver problema
-                            continue
-    finally:
-        # limpe o tmp (remova se quiser manter p/ debug)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-    # escrever CSV
-    cols = ["date","user_key","repo","branch","sha","message","is_merge","verified","url"]
-    with open(OUT_CSV, "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        rows.sort(key=lambda r: (r["user_key"], r["date"], r["repo"], r["sha"]))
-        w.writerows(rows)
-
-    print(f"[OK] CSV gerado: {OUT_CSV} ({len(rows)} linhas)")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main()#!/usr/bin/env python3
