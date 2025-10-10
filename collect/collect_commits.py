@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from github import Github, GithubException, RateLimitExceededException
 from dateutil import parser as date_parser
+from botocore.exceptions import ClientError  # (novo) para tratar NoSuchKey no cache
 
 # -------- Config via ENV --------
 GITHUB_API   = os.getenv("GITHUB_API", "https://api.github.com")
@@ -22,9 +23,15 @@ END_DATE     = os.getenv("END_DATE")
 REPO_FILTER  = os.getenv("REPO_FILTER", "")   
 S3_BUCKET    = os.getenv("S3_BUCKET")
 S3_PREFIX    = os.getenv("S3_PREFIX", "github/commits")
-MAX_WORKERS  = os.getenv("MAX_WORKERS", 5)
+MAX_WORKERS  = int(os.getenv("MAX_WORKERS", 5))
 
 UNSAFE_SKIP_TLS_VERIFY = os.getenv("UNSAFE_SKIP_TLS_VERIFY", "false").lower() in ("1", "true", "yes")
+FORCE_REPROCESS = os.getenv("FORCE_REPROCESS", "false").lower() in ("1", "true", "yes")  # (novo) força reprocesso
+
+REPO_LIMIT = os.getenv("REPO_LIMIT")  # número máximo de repositórios a processar (string opcional)
+UPLOAD_BATCH_SIZE = os.getenv("UPLOAD_BATCH_SIZE")  # sobe para S3 a cada N repositórios concluídos (string opcional)
+REPO_LIMIT = int(REPO_LIMIT) if REPO_LIMIT and REPO_LIMIT.isdigit() else None
+UPLOAD_BATCH_SIZE = int(UPLOAD_BATCH_SIZE) if UPLOAD_BATCH_SIZE and UPLOAD_BATCH_SIZE.isdigit() else None
 
 BOT_USERNAMES = {
     'dependabot[bot]',
@@ -92,22 +99,34 @@ def is_bot_user(username, author_name='', author_email=''):
 def check_rate_limit(github_client, min_remaining=100):
     """Checks and waits if necessary when rate limit is low"""
     rate_limit = github_client.get_rate_limit()
-    remaining = rate_limit.rate.remaining
-    reset_time = rate_limit.rate.reset
+    # compat: algumas versões usam .core/.limit; você já usa .rate.*
+    remaining = getattr(rate_limit.rate, "remaining", None)
+    reset_time = getattr(rate_limit.rate, "reset", None)
+    limit = getattr(rate_limit.rate, "limit", None)
     
-    print(f"Rate Limit: {remaining}/{rate_limit.rate.limit} requests remaining")
+    if remaining is None:
+        # fallback (não altera comportamento se .rate existir)
+        remaining = getattr(getattr(rate_limit, "core", object()), "remaining", 0)
+        reset_time = getattr(getattr(rate_limit, "core", object()), "reset", None)
+        limit = getattr(getattr(rate_limit, "core", object()), "limit", 0)
+
+    print(f"Rate Limit: {remaining}/{limit} requests remaining")
     
     # If less than min_remaining requests remain, wait for reset
-    if remaining < min_remaining:
+    if remaining < min_remaining and reset_time:
         wait_time = (reset_time - datetime.now(timezone.utc)).total_seconds() + 10
         if wait_time > 0:
             print(f"⚠️  Low rate limit! Waiting {int(wait_time/60)} minutes...")
             time.sleep(wait_time)
             print("✅ Rate limit reset. Continuing...")
-# Verify reset
+            # Verify reset
             rate_limit = github_client.get_rate_limit()
-            print(f"Rate Limit after reset: {rate_limit.rate.remaining}/{rate_limit.rate.limit}")
-
+            remaining2 = getattr(rate_limit.rate, "remaining", None)
+            limit2 = getattr(rate_limit.rate, "limit", None)
+            if remaining2 is None:
+                remaining2 = getattr(getattr(rate_limit, "core", object()), "remaining", 0)
+                limit2 = getattr(getattr(rate_limit, "core", object()), "limit", 0)
+            print(f"Rate Limit after reset: {remaining2}/{limit2}")
 
 def get_repositories(github_client, repo_filter, start_date, end_date):
     """Gets list of repositories from the organization (excludes archived)"""
@@ -135,6 +154,47 @@ def get_repositories(github_client, repo_filter, start_date, end_date):
         print(f"ℹ️  Excluded {skipped_count} repositories with no relevant activity")
 
     return filtered_repos
+
+# ----------------- helpers de cache por dia/repo -----------------
+def _marker_key(day_str: str, repo_name: str) -> str:
+    # mantém sob S3_PREFIX
+    return f"{S3_PREFIX}/_cache/v1/dt={day_str}/repo={repo_name}.done"
+
+def _list_processed_repos_for_day(s3_client, day_str: str):
+    prefix = f"{S3_PREFIX}/_cache/v1/dt={day_str}/"
+    processed = set()
+    paginator = s3_client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            # .../repo=<repo>.done
+            try:
+                repo = key.split("repo=", 1)[1].rsplit(".done", 1)[0]
+                if repo:
+                    processed.add(repo)
+            except Exception:
+                pass
+    return processed
+
+def _build_day_to_processed_map(s3_client, days):
+    return {d: _list_processed_repos_for_day(s3_client, d) for d in days}
+
+def _repo_fully_processed(day_to_processed, repo_name, days):
+    return all(repo_name in day_to_processed.get(d, set()) for d in days)
+
+def _mark_repo_processed_for_days(s3_client, repo_name, days):
+    for d in days:
+        s3_client.put_object(Bucket=S3_BUCKET, Key=_marker_key(d, repo_name), Body=b"")
+
+def _days_list(start_dt_utc, end_dt_utc):
+    days = []
+    cur = start_dt_utc.date()
+    end = end_dt_utc.date()
+    while cur <= end:
+        days.append(cur.strftime('%Y-%m-%d'))
+        cur += timedelta(days=1)
+    return days
+# -----------------------------------------------------------------------
 
 def process_single_repo(repo, start_date, end_date, github_client):
     """Process a single repository and return commits"""
@@ -198,7 +258,7 @@ def process_single_repo(repo, start_date, end_date, github_client):
         if bot_count > 0:
             status += f" (excluded {bot_count} bot commits)"
         
-return {
+        return {
             'success': True,
             'repo': repo_name,
             'commits': repo_commits,
@@ -233,30 +293,46 @@ def collect_commits(github_client, start_date, end_date, repo_filter, max_worker
     """Collects commits from all repositories in parallel"""
     repos = get_repositories(github_client, repo_filter, start_date, end_date)
     
+    days = _days_list(start_date, end_date)
+    s3_client = boto3.client("s3", verify=not UNSAFE_SKIP_TLS_VERIFY)
+    if UNSAFE_SKIP_TLS_VERIFY:
+        warnings.filterwarnings('ignore', category=urllib3.exceptions.InsecureRequestWarning)
+    day_to_processed = {d: set() for d in days} if FORCE_REPROCESS else _build_day_to_processed_map(s3_client, days)
+
+    repos_to_process = []
+    for r in repos:
+        if FORCE_REPROCESS or not _repo_fully_processed(day_to_processed, r.name, days):
+            repos_to_process.append(r)
+    if REPO_LIMIT is not None and REPO_LIMIT >= 0:
+        repos_to_process = repos_to_process[:REPO_LIMIT]
+
     # Structure: {username: {commit_sha: commit_data}}
     user_commits = defaultdict(dict)
+    # (novo) buffer para upload incremental (a cada UPLOAD_BATCH_SIZE repos)
+    batch_user_commits = defaultdict(dict)
+    repos_since_last_upload = 0
     
     total_repos = len(repos)
     print(f"\nTotal repositories to process: {total_repos}")
     print(f"Using {max_workers} parallel workers\n")
-    
+    print(f"Queued repositories after cache filter: {len(repos_to_process)}"
+          + (f" (limited to {REPO_LIMIT})" if REPO_LIMIT is not None else ""))
+
     processed = 0
     failed_repos = []
     
     # Process repos in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
         future_to_repo = {
             executor.submit(process_single_repo, repo, start_date, end_date, github_client): repo
-            for repo in repos
+            for repo in repos_to_process
         }
         
-        # Process completed tasks
         for future in as_completed(future_to_repo):
             processed += 1
             result = future.result()
 
-            print(f"[{processed}/{total_repos}] {result['repo']}: {result['status']}")
+            print(f"[{processed}/{len(repos_to_process)}] {result['repo']}: {result['status']}")
             
             if result['success']:
                 # Merge commits into main structure
@@ -264,6 +340,26 @@ def collect_commits(github_client, start_date, end_date, repo_filter, max_worker
                     for sha, commit_data in commits.items():
                         if sha not in user_commits[username]:
                             user_commits[username][sha] = commit_data
+                        # (novo) também no buffer do lote
+                        if sha not in batch_user_commits[username]:
+                            batch_user_commits[username][sha] = commit_data
+
+                # marca cache por dia/repo (objetos vazios)
+                try:
+                    _mark_repo_processed_for_days(s3_client, result['repo'], days)
+                    for d in days:
+                        day_to_processed.setdefault(d, set()).add(result['repo'])
+                except Exception as e:
+                    print(f"    ⚠️ Failed to write cache markers for {result['repo']}: {str(e)}")
+
+                # (novo) upload incremental por lote
+                repos_since_last_upload += 1
+                if UPLOAD_BATCH_SIZE and UPLOAD_BATCH_SIZE > 0 and repos_since_last_upload >= UPLOAD_BATCH_SIZE:
+                    print(f"\nUploading batch to S3 (batch size = {UPLOAD_BATCH_SIZE})...")
+                    upload_to_s3(batch_user_commits, start_date, end_date)
+                    batch_user_commits = defaultdict(dict)  # zera o buffer
+                    repos_since_last_upload = 0
+
             else:
                 failed_repos.append(result)
                 
@@ -271,8 +367,6 @@ def collect_commits(github_client, start_date, end_date, repo_filter, max_worker
                 if result.get('error') == 'rate_limit':
                     print(f"  Retrying {result['repo']} after rate limit reset...")
                     check_rate_limit(github_client, min_remaining=100)
-                    
-                    # Retry this repo
                     retry_result = process_single_repo(
                         future_to_repo[future], 
                         start_date, 
@@ -286,13 +380,30 @@ def collect_commits(github_client, start_date, end_date, repo_filter, max_worker
                             for sha, commit_data in commits.items():
                                 if sha not in user_commits[username]:
                                     user_commits[username][sha] = commit_data
-                        failed_repos.remove(result)
+                                if sha not in batch_user_commits[username]:
+                                    batch_user_commits[username][sha] = commit_data
+                        # marca cache também no retry
+                        try:
+                            _mark_repo_processed_for_days(s3_client, retry_result['repo'], days)
+                            for d in days:
+                                day_to_processed.setdefault(d, set()).add(retry_result['repo'])
+                        except Exception as e:
+                            print(f"    ⚠️ Failed to write cache markers for {retry_result['repo']}: {str(e)}")
+                        try:
+                            failed_repos.remove(result)
+                        except ValueError:
+                            pass
     
     # Report failed repos
     if failed_repos:
         print(f"\n⚠️  Failed to process {len(failed_repos)} repositories:")
         for failed in failed_repos:
             print(f"  - {failed['repo']}: {failed['status']}")
+
+    # (novo) se restou algo no buffer, sobe agora
+    if UPLOAD_BATCH_SIZE and repos_since_last_upload > 0:
+        print(f"\nUploading final batch to S3 (remaining {repos_since_last_upload} repos in buffer)...")
+        upload_to_s3(batch_user_commits, start_date, end_date)
     
     return user_commits
 
@@ -311,8 +422,8 @@ def upload_to_s3(user_commits, start_date, end_date):
             commits_by_date[commit_date].append(commit_data)
         
         # Upload one file per date
-        for date, day_commits in commits_by_date.items():
-            date_str = date.strftime('%Y-%m-%d')
+        for date_, day_commits in commits_by_date.items():
+            date_str = date_.strftime('%Y-%m-%d')
             s3_key = f"{S3_PREFIX}/{username}/{date_str}/commits.json"
             
             # Check if file already exists for this date
@@ -322,8 +433,10 @@ def upload_to_s3(user_commits, start_date, end_date):
                 existing_commits = {
                     c['sha']: c for c in json.loads(response['Body'].read())
                 }
-            except s3_client.exceptions.NoSuchKey:
-                pass
+            except ClientError as e:
+                code = e.response.get('Error', {}).get('Code')
+                if code not in ('NoSuchKey', '404', 'NotFound'):
+                    raise
             
             # Merge with existing commits (avoid duplicates)
             for commit in day_commits:
@@ -346,7 +459,7 @@ def main():
     
     # GitHub client
     github_token = os.getenv('GITHUB_TOKEN')
-    g = Github(github_token, per_page=100)  # Optimize pagination
+    g = Github(github_token, base_url=GITHUB_API, per_page=100)  # Optimize pagination
     
     # Check initial rate limit
     print("="*60)
@@ -356,6 +469,12 @@ def main():
     # Collect commits
     print(f"\nCollecting commits from {START_DATE} to {END_DATE}")
     print(f"Excluding bot commits: {len(BOT_USERNAMES)} known bots")
+    if FORCE_REPROCESS:
+        print("⚠️  FORCE_REPROCESS=true: ignoring cache for this run.")
+    if REPO_LIMIT is not None:
+        print(f"ℹ️  REPO_LIMIT={REPO_LIMIT} (maximum repos this run)")
+    if UPLOAD_BATCH_SIZE:
+        print(f"ℹ️  UPLOAD_BATCH_SIZE={UPLOAD_BATCH_SIZE} (upload after each batch)")
     
     user_commits = collect_commits(
         g, 
