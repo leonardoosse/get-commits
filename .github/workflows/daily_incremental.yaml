@@ -1,8 +1,8 @@
 name: daily_commits
 
 on:
-  schedule:
-    - cron: "15 03 * * *"  # 03:15 UTC (~00:15 BRT)
+  # schedule:
+  #   - cron: "15 03 * * *"  # 03:15 UTC (~00:15 BRT)
   workflow_dispatch:
 
 permissions:
@@ -57,3 +57,4 @@ jobs:
           S3_PREFIX: ${{ env.S3_PREFIX }}
         run: |
           python scripts/collect_commits.py
+
